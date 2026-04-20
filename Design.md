@@ -1,6 +1,6 @@
 # OpenClaw ↔ Hermes 记忆同步系统设计文档
 
-> 版本：v3.0 MCP 版  
+> 版本：v3.0 MCP 版（本文档同时包含完整 MCP 架构设计与附录 A：极简共享文件方案）  
 > 状态：设计阶段 → 可进入开发实施  
 > 技术栈：Python / FastMCP / mcp-python-sdk / PostgreSQL（或 SQLite）/ Watchdog / ChromaDB / Docker / uvicorn
 
@@ -1832,6 +1832,8 @@ alembic downgrade -1
 
 **验收标准**：OpenClaw 调用 `memory_update` → 2s 内 Hermes 通过 `memory_get` 读取到一致数据
 
+> 💡 提示：如果你只是个人用户、只有 2 个 Agent 且不想部署完整的 MCP 架构，请参阅文档末尾的「**附录 A：极简共享文件方案**」。该方案无需数据库、服务进程或协议，仅通过硬链接 + Git 快照即可实现准实时共享。
+
 ---
 
 ## Milestone 2：Resources + Subscriptions + 双向同步（第 3-4 周）
@@ -1931,3 +1933,670 @@ alembic downgrade -1
 * **状态外化**（Markdown Projection）
 
 > 本文档覆盖设计、MCP 协议、模型、模块、时序、性能、安全、部署、测试、监控、备份、里程碑全链路，可直接作为开发实施的依据。
+
+
+---
+
+# 附录 A：极简共享文件方案（推荐用于个人场景）
+
+> 本附录提供一套与主文档 v3.0 MCP 架构并行的极简方案。
+> 如果你只有 2 个 Agent（OpenClaw 与 Hermes）、不需要向量检索与多用户协作，建议直接从这里开始。
+
+---
+
+## A.1 核心思想
+
+文件本身就是 Single Source of Truth。
+
+这个方案不需要数据库、不需要协议、不需要服务进程。两个 Agent 同时读写同一个 inode（硬链接），任何一方修改了内容，另一方立即可见。修改的同时，本地 Git 仓库立即自动 commit 一次，形成不可篡改的版本历史。
+
+简而言之：
+
+* **硬链接**：让两个 Agent 读写同一个 inode
+* **Git 快照**：任何修改立即自动 commit，不推送远端
+* **零依赖**：无需数据库、无需服务进程、无需协议
+
+---
+
+## A.2 为什么选择这个方案
+
+### 与 MCP 方案的对比
+
+| 维度 | 极简共享文件方案 | v3.0 MCP 方案 |
+|------|------------------|----------------|
+| 存储 | 文件系统（Markdown） | PostgreSQL / SQLite + ChromaDB |
+| 同步协议 | 硬链接（OS 层面） | MCP 协议（JSON-RPC） |
+| 服务进程 | 无 | Memory MCP Server 常驻进程 |
+| 部署复杂度 | 一键脚本 | Docker / Python 环境 / 数据库 |
+| 检索能力 | grep / rg 文本搜索 | BM25 + 向量混合检索 |
+| 版本控制 | Git 本地快照 | DB 事务 + 乐观锁 |
+| 适用规模 | 1 人、2 个 Agent | 多用户、多 Agent、跨网络 |
+| 开发周期 | 10 分钟 | 2-4 周 |
+
+### 适用场景
+
+**选择极简方案，如果你符合以下任意条件：**
+
+* 只有 OpenClaw 和 Hermes 两个 Agent
+* 同一台电脑上运行
+* 不需要结构化检索（如向量搜索、标签聚合）
+* 不想维护数据库和服务进程
+* 希望今天下午就能用上
+
+**选择 v3.0 MCP 方案，如果你需要：**
+
+* 多个 Agent 或多用户协作
+* 高级检索（语义搜索、相似度排序）
+* 跨机器或跨网络访问
+* 需要细粒度权限控制与审计日志
+* 需要专业级的冲突解决与版本管理
+
+---
+
+## A.3 硬链接 vs 符号链接
+
+| 特性 | 硬链接 (Hard Link) | 符号链接 (Symbolic Link) |
+|------|---------------------|--------------------------|
+| inode | 与源文件同一 inode | 新的 inode，指向路径 |
+| 读写延迟 | 零延迟（直接访问数据块） | 需解析路径（极低延迟，但非零） |
+| 程序透明度 | Agent 无感知（看起来就是普通文件） | 部分程序可能不支持跟踪 symlink |
+| 源文件删除 | 数据仍然保留（只要还有硬链接引用） | 数据丢失（挂空链） |
+| 跨文件系统 | 不支持 | 支持 |
+| macOS APFS | 完全支持 | 完全支持 |
+
+### 推荐硬链接的理由
+
+1. **同一 inode**：两个路径完全等价，任何一方的修改对另一方立即可见
+2. **零延迟**：没有路径解析开销，程序读写性能最优
+3. **Agent 无感知**：OpenClaw 和 Hermes 都不需要知道硬链接的存在，对它们来说就是普通文件
+4. **删除安全**：即使不小心删除了某一侧的 "MEMORY.md"，只要 `~/.shared-memory/` 下的原始文件还在，数据就不会丢失
+5. **macOS 友好**：APFS 对硬链接的支持非常成熟，没有兼容性风险
+
+> ⚠️ 注意：硬链接不能跨文件系统。因此两个 Agent 必须在同一台电脑上运行。
+
+---
+
+## A.4 目录结构
+
+```
+~/.shared-memory/          ← 物理文件所在
+├── MEMORY.md
+├── USER.md
+└── .git/                  ← 本地 Git 仓（无 remote）
+
+~/.hermes/memory/
+├── MEMORY.md  ← 硬链接到 ~/.shared-memory/MEMORY.md
+└── USER.md    ← 硬链接到 ~/.shared-memory/USER.md
+
+~/.openclaw/workspace/
+├── MEMORY.md  ← 硬链接到 ~/.shared-memory/MEMORY.md
+└── USER.md    ← 硬链接到 ~/.shared-memory/USER.md
+```
+
+**关键观察：**
+
+* `~/.shared-memory/` 是唯一存放数据块的目录
+* `~/.hermes/memory/MEMORY.md` 和 `~/.openclaw/workspace/MEMORY.md` 是同一个 inode 的两个路径
+* 任何一方通过任何路径写入，其他路径立即可见
+* `.git/` 仅存在于 `~/.shared-memory/`，不影响两个 Agent 合同的其他文件
+
+---
+
+## A.5 实施步骤
+
+以下是一份完整可复制执行的 Shell 脚本。请根据你实际的路径进行调整。
+
+```bash
+#!/bin/bash
+# setup-shared-memory.sh
+# 极简共享记忆系统初始化脚本
+
+set -euo pipefail
+
+# ==================== 配置 ====================
+SHARED_DIR="$HOME/.shared-memory"
+HERMES_DIR="$HOME/.hermes/memory"
+OPENCLAW_DIR="$HOME/.openclaw/workspace"
+
+# 如果你的实际路径不同，请修改以上三个变量
+# ==================================================
+
+echo "【步骤 1】创建共享目录..."
+mkdir -p "$SHARED_DIR"
+mkdir -p "$HERMES_DIR"
+mkdir -p "$OPENCLAW_DIR"
+
+echo "【步骤 2】复制现有文件到共享目录..."
+# 如果两侧都已有文件，建议手动合并后放入 $SHARED_DIR
+# 下面的逻辑是：优先从 Hermes 复制，若不存在则尝试 OpenClaw
+if [ -f "$HERMES_DIR/MEMORY.md" ]; then
+    cp "$HERMES_DIR/MEMORY.md" "$SHARED_DIR/MEMORY.md"
+    echo "  从 $HERMES_DIR/MEMORY.md 复制"
+elif [ -f "$OPENCLAW_DIR/MEMORY.md" ]; then
+    cp "$OPENCLAW_DIR/MEMORY.md" "$SHARED_DIR/MEMORY.md"
+    echo "  从 $OPENCLAW_DIR/MEMORY.md 复制"
+else
+    touch "$SHARED_DIR/MEMORY.md"
+    echo "  创建空的 MEMORY.md"
+fi
+
+if [ -f "$HERMES_DIR/USER.md" ]; then
+    cp "$HERMES_DIR/USER.md" "$SHARED_DIR/USER.md"
+    echo "  从 $HERMES_DIR/USER.md 复制"
+elif [ -f "$OPENCLAW_DIR/USER.md" ]; then
+    cp "$OPENCLAW_DIR/USER.md" "$SHARED_DIR/USER.md"
+    echo "  从 $OPENCLAW_DIR/USER.md 复制"
+else
+    touch "$SHARED_DIR/USER.md"
+    echo "  创建空的 USER.md"
+fi
+
+echo "【步骤 3】备份旧文件（重命名）..."
+[ -f "$HERMES_DIR/MEMORY.md" ] && [ ! -L "$HERMES_DIR/MEMORY.md" ] && mv "$HERMES_DIR/MEMORY.md" "$HERMES_DIR/MEMORY.md.bak.$(date +%s)"
+[ -f "$HERMES_DIR/USER.md" ]   && [ ! -L "$HERMES_DIR/USER.md" ]   && mv "$HERMES_DIR/USER.md"   "$HERMES_DIR/USER.md.bak.$(date +%s)"
+[ -f "$OPENCLAW_DIR/MEMORY.md" ] && [ ! -L "$OPENCLAW_DIR/MEMORY.md" ] && mv "$OPENCLAW_DIR/MEMORY.md" "$OPENCLAW_DIR/MEMORY.md.bak.$(date +%s)"
+[ -f "$OPENCLAW_DIR/USER.md" ]   && [ ! -L "$OPENCLAW_DIR/USER.md" ]   && mv "$OPENCLAW_DIR/USER.md"   "$OPENCLAW_DIR/USER.md.bak.$(date +%s)"
+
+echo "【步骤 4】创建硬链接..."
+ln "$SHARED_DIR/MEMORY.md" "$HERMES_DIR/MEMORY.md"
+ln "$SHARED_DIR/USER.md"   "$HERMES_DIR/USER.md"
+ln "$SHARED_DIR/MEMORY.md" "$OPENCLAW_DIR/MEMORY.md"
+ln "$SHARED_DIR/USER.md"   "$OPENCLAW_DIR/USER.md"
+
+echo "【步骤 5】初始化本地 Git 仓库（无 remote）..."
+cd "$SHARED_DIR"
+if [ ! -d ".git" ]; then
+    git init
+    git config user.email "memory-guard@local"
+    git config user.name "Memory Guard"
+    git add -A
+    git commit -m "init: 极简共享记忆系统初始化"
+    echo "  Git 仓库已初始化并提交"
+else
+    echo "  Git 仓库已存在，跳过"
+fi
+
+echo ""
+echo "✓ 完成！以下是硬链接验证信息："
+ls -li "$SHARED_DIR/MEMORY.md" "$HERMES_DIR/MEMORY.md" "$OPENCLAW_DIR/MEMORY.md"
+ls -li "$SHARED_DIR/USER.md"   "$HERMES_DIR/USER.md"   "$OPENCLAW_DIR/USER.md"
+
+echo ""
+echo "提示：请确认三列的 inode 号是否相同。如果相同，说明硬链接已正确创建。"
+```
+
+### 运行方法
+
+```bash
+chmod +x setup-shared-memory.sh
+./setup-shared-memory.sh
+```
+
+### 事前准备
+
+* 确保 `$HOME/.hermes/memory/` 和 `$HOME/.openclaw/workspace/` 的路径与你的实际环境一致
+* 如果两侧已经同时存在 MEMORY.md / USER.md，建议手动合并内容后再执行脚本
+* 该脚本会自动备份旧文件为 `.bak.时间戳`，避免数据丢失
+
+---
+
+## A.6 即时 Git 快照机制（核心）
+
+这是整个方案的核心保险组件。我们使用 Python `watchdog` 写一个极简的守护脚本 `memory-guard.py`，它会监听 `~/.shared-memory/` 目录下的所有 `.md` 文件，文件发生任何变更时立即自动执行 `git add -A && git commit`。
+
+### 守护脚本：memory-guard.py
+
+```python
+#!/usr/bin/env python3
+# memory-guard.py
+# 极简共享记忆系统 - Git 快照守护进程
+
+import os
+import sys
+import time
+import subprocess
+import signal
+from datetime import datetime
+from pathlib import Path
+
+try:
+    from watchdog.observers import Observer
+    from watchdog.events import FileSystemEventHandler, FileModifiedEvent, FileCreatedEvent, FileDeletedEvent
+except ImportError:
+    print("错误：请先安装 watchdog: pip install watchdog")
+    sys.exit(1)
+
+# ==================== 配置 ====================
+WATCH_DIR = os.path.expanduser("~/.shared-memory")
+PID_FILE = os.path.expanduser("~/.shared-memory/.memory-guard.pid")
+DEBOUNCE_SECONDS = 2.0  # 防止频繁修改导致连续 commit
+# ==================================================
+
+
+class GitSnapshotHandler(FileSystemEventHandler):
+    def __init__(self):
+        self._last_commit = 0
+        self._pending = False
+
+    def on_modified(self, event):
+        if event.is_directory:
+            return
+        if event.src_path.endswith(".md"):
+            self._trigger_commit()
+
+    def on_created(self, event):
+        if event.is_directory:
+            return
+        if event.src_path.endswith(".md"):
+            self._trigger_commit()
+
+    def on_deleted(self, event):
+        if event.is_directory:
+            return
+        if event.src_path.endswith(".md"):
+            self._trigger_commit()
+
+    def _trigger_commit(self):
+        now = time.time()
+        if now - self._last_commit < DEBOUNCE_SECONDS:
+            self._pending = True
+            return
+        self._do_commit()
+        self._pending = False
+
+    def _do_commit(self):
+        timestamp = datetime.now().strftime("%Y-%m-%d-%H:%M:%S")
+        try:
+            result = subprocess.run(
+                ["git", "add", "-A"],
+                cwd=WATCH_DIR,
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            result = subprocess.run(
+                ["git", "commit", "-m", f"auto: {timestamp}"],
+                cwd=WATCH_DIR,
+                capture_output=True,
+                text=True,
+            )
+            # commit 可能会因为无变更而失败，这是正常的
+            if result.returncode == 0:
+                print(f"[✓] {timestamp} Git 快照已创建")
+            else:
+                # 无变更或其他非致命错误
+                pass
+            self._last_commit = time.time()
+        except Exception as e:
+            print(f"[✗] {timestamp} Git 快照失败: {e}", file=sys.stderr)
+
+
+def is_already_running() -> bool:
+    if not os.path.exists(PID_FILE):
+        return False
+    try:
+        with open(PID_FILE, "r") as f:
+            pid = int(f.read().strip())
+        os.kill(pid, 0)
+        return True
+    except (ValueError, OSError):
+        return False
+
+
+def kill_existing():
+    if not os.path.exists(PID_FILE):
+        return
+    try:
+        with open(PID_FILE, "r") as f:
+            pid = int(f.read().strip())
+        os.kill(pid, signal.SIGTERM)
+        time.sleep(0.5)
+        print(f"已终止旧的守护进程 (PID: {pid})")
+    except Exception:
+        pass
+    finally:
+        if os.path.exists(PID_FILE):
+            os.remove(PID_FILE)
+
+
+def main():
+    if not os.path.isdir(WATCH_DIR):
+        print(f"错误：监听目录不存在: {WATCH_DIR}")
+        sys.exit(1)
+
+    git_dir = os.path.join(WATCH_DIR, ".git")
+    if not os.path.isdir(git_dir):
+        print(f"错误：{WATCH_DIR} 不是 Git 仓库，请先执行 git init")
+        sys.exit(1)
+
+    # 平滑重启：如果已有实例在运行，先 kill 掉旧的
+    if is_already_running():
+        kill_existing()
+
+    with open(PID_FILE, "w") as f:
+        f.write(str(os.getpid()))
+
+    event_handler = GitSnapshotHandler()
+    observer = Observer()
+    observer.schedule(event_handler, WATCH_DIR, recursive=False)
+    observer.start()
+
+    print(f"memory-guard 已启动 (PID: {os.getpid()})")
+    print(f"监听目录: {WATCH_DIR}")
+    print("任何 .md 文件的修改、创建、删除都会触发 Git commit")
+    print("按 Ctrl+C 停止...")
+
+    try:
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        observer.stop()
+        print("
+正在停止...")
+    finally:
+        observer.join()
+        if os.path.exists(PID_FILE):
+            os.remove(PID_FILE)
+        print("memory-guard 已退出")
+
+
+if __name__ == "__main__":
+    main()
+```
+
+### 启动命令
+
+```bash
+# 前台运行（调试时使用）
+python3 memory-guard.py
+
+# 后台运行（常驻使用）
+nohup python3 memory-guard.py > ~/.shared-memory/.memory-guard.log 2>&1 &
+```
+
+### macOS launchd 配置（开机自启）
+
+创建 `~/Library/LaunchAgents/com.local.memory-guard.plist`：
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.local.memory-guard</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/bin/python3</string>
+        <string>/Users/YOUR_USERNAME/.shared-memory/memory-guard.py</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/YOUR_USERNAME/.shared-memory</string>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>/Users/YOUR_USERNAME/.shared-memory/.memory-guard.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/Users/YOUR_USERNAME/.shared-memory/.memory-guard.err.log</string>
+</dict>
+</plist>
+```
+
+> ⚠️ 请将以下路径中的 `YOUR_USERNAME` 替换为你的实际用户名，或直接使用 `$HOME` 的展开路径。
+
+加载并启用：
+
+```bash
+launchctl load ~/Library/LaunchAgents/com.local.memory-guard.plist
+launchctl start com.local.memory-guard
+
+# 查看状态
+launchctl list | grep memory-guard
+```
+
+### 重点强调
+
+* **本地仓库，无远端**：Git 仓库不设置任何 `remote`，所有提交都只保留在本地磁盘
+* **不推送远端**：这是设计上的刻意为之，避免意外泄露个人记忆到云端
+* **防抖机制**：2 秒窗口期内的多次变更会被合并为一次 commit，避免过于频繁的提交
+* **平滑重启**：脚本启动时会检查 PID 文件，若已有实例运行则先终止旧进程
+
+---
+
+## A.7 本地 Git 配置
+
+### 初始化本地仓
+
+```bash
+cd ~/.shared-memory
+git init
+
+# 不添加任何 remote
+# git remote add origin ...  ← 有意不这么做
+
+git config user.email "memory-guard@local"
+git config user.name "Memory Guard"
+
+git add -A
+git commit -m "init: 本地记忆仓库初始化"
+```
+
+### .gitignore 示例
+
+```gitignore
+# 排除守护进程自身的日志与状态文件
+.memory-guard.pid
+.memory-guard.log
+.memory-guard.err.log
+memory-guard.py
+setup-shared-memory.sh
+
+# 排除编辑器临时文件
+*.swp
+*.swo
+*~
+.DS_Store
+```
+
+### 查看历史与回滚
+
+```bash
+cd ~/.shared-memory
+
+# 查看最近 20 条提交
+ git log --oneline -20
+
+# 查看某次提交的具体变更
+git show <commit-hash>
+
+# 回滚单个文件到指定版本
+git checkout <commit-hash> -- MEMORY.md
+
+# 如果回滚后想保留，记得提交
+git add -A
+git commit -m "manual: 回滚 MEMORY.md 到 <commit-hash>"
+```
+
+---
+
+## A.8 冲突处理与回滚
+
+### 硬链接方案下的“冲突”本质
+
+由于两个 Agent 读写同一个 inode，不存在传统意义上的“同时修改同一行导致 merge conflict”。这里的冲突是：
+
+* **覆盖写入**：如果两个 Agent 在极短时间内先后写入同一个文件，后写的会覆盖先写的
+* **空间间隔**：如果两个 Agent 修改的是文件的不同区域，内容会自然合并（因为是同一个 inode，后一次写入包含了前一次的变更）
+
+### 回滚方法
+
+如果发现内容被覆盖或误删：
+
+```bash
+cd ~/.shared-memory
+
+# 查看历史提交
+ git log --oneline -10
+
+# 例如输出：
+# a1b2c3d auto: 2026-04-20-14:30:00
+# e4f5g6h auto: 2026-04-20-14:25:00
+# i7j8k9l init: 极简共享记忆系统初始化
+
+# 回滚到上一个版本
+git checkout e4f5g6h -- MEMORY.md
+
+# 或者从历史中提取某段内容合并到当前
+ git show e4f5g6h:MEMORY.md > /tmp/MEMORY_old.md
+# 手动合并后保存
+git add -A
+git commit -m "manual: 从 e4f5g6h 恢复 MEMORY.md"
+```
+
+### 如何避免覆盖
+
+* 两个 Agent 并不会真正“同时”写入磁盘，OS 层面会有一定的排序
+* 如果担心重要内容被覆盖，可以在修改前手动停止其中一个 Agent
+* Git 快照保证了任何覆盖都是可逆的
+
+---
+
+## A.9 隔离与安全
+
+### 文件隔离
+
+* 硬链接仅共享 `MEMORY.md` 和 `USER.md` 两个文件
+* OpenClaw 的其他 workspace 文件和 Hermes 的其他 memory 文件完全不受影响
+* 两侧的配置、依赖、环境变量彼此隔离
+
+### 格式标准化
+
+* 如果 OpenClaw 和 Hermes 对 MEMORY.md / USER.md 的格式期望不一致（例如一方使用一级标题、另一方使用二级标题），需要手动标准化一次
+* 建议参照主文档中的 "文件层（Projection）"部分统一标准格式
+* 一旦格式统一，两侧后续的自然写入就会自然保持一致
+
+---
+
+## A.10 渐进增强路径
+
+这个方案的设计理念是 "从简单开始，在需要的时候才加复杂度"。
+
+| 阶段 | 时机 | 行动 | 成本 |
+|------|------|------|------|
+| **阶段 1** | 现在 | 硬链接共享 + Git 快照 | 10 分钟 |
+| **阶段 2** | 记忆膨胀后 | 加 `rg` / `grep` 搜索脚本 | 5 分钟 |
+| **阶段 3** | 需要结构化检索时 | 在旁边加 SQLite 索引（仅索引，不迁移主数据） | 1 天 |
+| **阶段 4** | 两边都原生支持 MCP 且需要复杂交互 | 考虑 v3.0 的 MCP 方案 | 2-4 周 |
+
+### 各阶段详解
+
+**阶段 1（当前）**
+
+仅使用硬链接和 Git 快照。对于大部分个人场景，这已经足够。
+
+**阶段 2**
+
+当 MEMORY.md 股票到几千行时，纯凭人眼浏览效率低下。此时可以写一个简单的 shell alias：
+
+```bash
+# 添加到 ~/.zshrc 或 ~/.bashrc
+alias mg='cd ~/.shared-memory && rg -i'
+
+# 使用示例：搜索 "减重"
+mg "减重"
+```
+
+**阶段 3**
+
+如果需要按标签、时间、重要性筛选，可以在旁边维护一个 SQLite 索引：
+
+* Markdown 文件仍然是 Single Source of Truth
+* SQLite 仅作为读取优化的索引
+* 写入仍然只走 Markdown 文件
+
+**阶段 4**
+
+当两边都原生支持 MCP，且你需要：
+
+* 跨设备访问
+* 多个 Agent 协作
+* 语义检索
+* 细粒度的权限控制
+
+这时才值得投入 v3.0 MCP 方案的开发成本。
+
+---
+
+## A.11 故障排查
+
+### 确认硬链接生效
+
+```bash
+ls -li ~/.shared-memory/MEMORY.md ~/.hermes/memory/MEMORY.md ~/.openclaw/workspace/MEMORY.md
+```
+
+输出示例：
+
+```
+12345678 -rw-r--r--  3 user  group  2048 Apr 20 14:00 /Users/user/.shared-memory/MEMORY.md
+12345678 -rw-r--r--  3 user  group  2048 Apr 20 14:00 /Users/user/.hermes/memory/MEMORY.md
+12345678 -rw-r--r--  3 user  group  2048 Apr 20 14:00 /Users/user/.openclaw/workspace/MEMORY.md
+```
+
+**关键检查点：**
+
+* 第一列（inode 号）必须完全相同（如上例中的 `12345678`）
+* 第三列（链接数）必须是 `3`（表示该 inode 有 3 个路径引用）
+
+### 确认守护进程在运行
+
+```bash
+# 方法 1：查找进程
+ps aux | grep memory-guard
+
+# 方法 2：查看 PID 文件
+cat ~/.shared-memory/.memory-guard.pid
+
+# 方法 3（macOS）：查看 launchd 状态
+launchctl list | grep memory-guard
+```
+
+### 确认 Git 快照在工作
+
+```bash
+cd ~/.shared-memory
+
+# 查看最近 5 条提交
+ git log --oneline -5
+
+# 期望输出示例：
+# a1b2c3d auto: 2026-04-20-14:30:00
+# e4f5g6h auto: 2026-04-20-14:25:00
+# i7j8k9l auto: 2026-04-20-14:20:00
+# ...
+
+# 如果你修改了 MEMORY.md 后等待 2-3 秒，再执行上面命令，应该能看到新的 auto 提交
+```
+
+### 常见问题
+
+| 现象 | 原因 | 解决 |
+|------|------|------|
+| inode 号不同 | 脚本创建的是普通文件而非硬链接 | 检查 `ln` 命令是否执行成功，或是否跨设备了 |
+| 守护进程启动失败 | 未安装 watchdog | `pip install watchdog` |
+| Git commit 没有触发 | 文件修改发生在非监听目录 | 确认修改的是 `~/.shared-memory/` 下的文件，而不是原始位置 |
+| 提交信息里有 "nothing to commit" | 防抖机制合并了变更 | 正常行为，只要最终有一次提交即可 |
+| 删除一侧的 MEMORY.md 后数据丢失 | 删除的是共享 inode 的最后一个路径 | 从 Git 历史中恢复：`git checkout HEAD -- MEMORY.md` |
+
+---
+
+> 本附录完。如果这个极简方案在未来不再满足你的需求，请回到主文档的 v3.0 MCP 架构设计。两套方案并行存在，可以随时迁移。
